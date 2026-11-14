@@ -174,6 +174,9 @@ class Document:
         self.retry_length = retry_length
         self.xpath = xpath
         self.handle_failures = handle_failures
+        # Synthetic containers created by get_article(): they wrap the
+        # extracted content but are not part of the source document.
+        self._output_roots = set()
 
     def _html(self, force=False):
         if force or self.html is None:
@@ -257,6 +260,9 @@ class Document:
             ruthless = True
             while True:
                 self._html(True)
+                # The DOM is rebuilt on every pass, so synthetic roots from
+                # earlier attempts no longer belong to the current tree.
+                self._output_roots.clear()
                 for i in self.tags(self.html, "script", "style", "noscript"):
                     i.drop_tree()
                 for i in self.tags(self.html, "body"):
@@ -277,7 +283,10 @@ class Document:
 
                 if best_candidate:
                     article = self.get_article(
-                        candidates, best_candidate, html_partial=html_partial
+                        candidates,
+                        best_candidate,
+                        html_partial=html_partial,
+                        keep_all_images=keep_all_images,
                     )
                 else:
                     if ruthless:
@@ -297,6 +306,14 @@ class Document:
                         article = self.html.find("body")
                         if article is None:
                             article = self.html
+                        if html_partial:
+                            # Keep the same div wrapping as the normal path so
+                            # partial summaries never degrade into a full body.
+                            partial = fragment_fromstring("<div/>")
+                            for child in list(article):
+                                partial.append(child)
+                            article = partial
+                            self._output_roots.add(article)
                 cleaned_article = self.sanitize(article, candidates, keep_all_images)
 
                 article_for_length = cleaned_article or ""
@@ -315,7 +332,13 @@ class Document:
             log.exception("error getting summary: ")
             raise Unparseable(str(e)).with_traceback(sys.exc_info()[2])
 
-    def get_article(self, candidates, best_candidate, html_partial=False):
+    def get_article(
+        self,
+        candidates,
+        best_candidate,
+        html_partial=False,
+        keep_all_images=False,
+    ):
         # Now that we have the top candidate, look through its siblings for
         # content that might also be related.
         # Things like preambles, content split by ads that we removed, etc.
@@ -339,6 +362,7 @@ class Document:
             output_root = output
         else:
             output_root = output.getchildren()[0].getchildren()[0]
+        self._output_roots.add(output_root)
         for lead in reversed(editorial_leads):
             best_elem.insert(0, lead)
         for sibling in siblings:
@@ -348,6 +372,10 @@ class Document:
             if sibling in editorial_leads:
                 continue
             if sibling is best_elem:
+                append = True
+            if keep_all_images and self.is_keepable_image_block(sibling):
+                # Gallery blocks next to the scored text container hold the
+                # rest of the article's images but rarely score on their own.
                 append = True
             sibling_key = sibling  # HashableElement(sibling)
             if (
@@ -904,6 +932,143 @@ class Document:
         })
         return allowed
 
+    def is_chrome_container(self, elem):
+        """Page furniture (sidebars, related links, comments, ...) rather
+        than article content, even when it happens to contain images."""
+        if elem.xpath(
+            "ancestor-or-self::aside | ancestor-or-self::nav | "
+            "ancestor-or-self::form"
+        ):
+            return True
+        features = "{} {}".format(elem.get("class", ""), elem.get("id", ""))
+        if features.strip() and REGEXES["negativeRe"].search(features):
+            return True
+        return False
+
+    def is_image_content_block(self, elem):
+        """An image-bearing block that belongs to the article body.
+
+        Gallery markup uses ``section``, ``table``, ``ul`` and sibling
+        containers in addition to ``div``; only protect blocks that hold at
+        least one image, live inside an ``article``/``main`` semantic frame
+        and are not page furniture such as sidebars or related-post widgets.
+        """
+        if elem.tag not in ("div", "section", "table", "ul"):
+            return False
+        if elem in self._output_roots:
+            # The synthetic output container must stay subject to the
+            # regular pruning rules.
+            return False
+        if not elem.findall(".//img"):
+            return False
+        if not elem.xpath("ancestor-or-self::article | ancestor-or-self::main"):
+            return False
+        return not self.is_chrome_container(elem)
+
+    def is_keepable_image_block(self, elem):
+        """Any image-bearing block worth retaining when keep_all_images is on.
+
+        The explicit opt-in keeps images regardless of the surrounding
+        semantic frame, but page furniture (sidebars, related links,
+        comments, ...) stays excluded.
+        """
+        if elem.tag not in ("div", "section", "table", "ul"):
+            return False
+        if elem in self._output_roots:
+            return False
+        if not elem.findall(".//img"):
+            return False
+        return not self.is_chrome_container(elem)
+
+    def handle_image_block(self, el, keep_all_images, min_text_length):
+        """Apply image-aware pruning before the regular content rules.
+
+        Returns ``True`` when the element was fully handled (kept or
+        dropped), ``False`` when the regular pruning rules must decide.
+        """
+        is_output_root = el in self._output_roots
+        if (
+            not is_output_root
+            and el.findall(".//img")
+            and self.is_chrome_container(el)
+            and text_length(el) < min_text_length
+        ):
+            # Image-led furniture (sidebars, related posts, comments...)
+            # never qualifies as article images, even with
+            # keep_all_images. Chrome blocks carrying real text stay
+            # subject to the regular pruning rules.
+            log.debug("Removed chrome image container %s" % describe(el))
+            el.drop_tree()
+            return True
+        if keep_all_images and (
+            is_output_root or self.is_keepable_image_block(el)
+        ):
+            # Keep every image-bearing block of the article body, whatever
+            # its tag (div, section, table, ul, ...), and never prune the
+            # synthetic container wrapping the selection.
+            return True
+        if is_output_root and el.findall(".//img"):
+            # The wrapper holds the selected article content, including
+            # gallery images; pruning it for being image-heavy would
+            # discard the whole extraction.
+            return True
+        return False
+
+    def _block_removal_reason(
+        self, el, tag, weight, counts, content_length, link_density,
+        image_content_block, min_text_length,
+    ):
+        """Decide why a candidate block should be pruned.
+
+        Returns the reason string when the block must be removed, otherwise
+        ``None``. Image-only body blocks are intentionally kept so gallery
+        articles cannot collapse into empty shells.
+        """
+        if counts["p"] and counts["img"] > 1 + counts["p"] * 1.3:
+            return "too many images (%s)" % counts["img"]
+        if counts["li"] > counts["p"] and tag not in ("ol", "ul"):
+            return "more <li>s than <p>s"
+        if counts["input"] > (counts["p"] / 3):
+            return "less than 3x <p>s than <input>s"
+        if content_length < min_text_length and counts["img"] == 0:
+            return (
+                "too short content length %s without a single image"
+                % content_length
+            )
+        if content_length < min_text_length and counts["img"] > 2:
+            return (
+                "too short content length %s and too many images"
+                % content_length
+            )
+        if weight < 25 and link_density > (
+            0.25
+            if tag in ("ul", "section")
+            and el.xpath("ancestor::main | ancestor::article")
+            else 0.2
+        ):
+            return "too many links {:.3f} for its weight {}".format(
+                link_density, weight
+            )
+        if weight >= 25 and link_density > 0.5:
+            return "too many links {:.3f} for its weight {}".format(
+                link_density, weight
+            )
+        if (counts["embed"] == 1 and content_length < 75) or counts[
+            "embed"
+        ] > 1:
+            return (
+                "<embed>s with too short content length, or too many <embed>s"
+            )
+        if not content_length:
+            if image_content_block:
+                # A gallery block carries its content in images rather than
+                # text; keeping it prevents image-heavy articles from
+                # collapsing into empty shells.
+                log.debug("Allowing image-only content block %s" % describe(el))
+                return None
+            return "no content"
+        return None
+
     def sanitize(self, node, candidates, keep_all_images=False):
         MIN_LEN = self.min_text_length
         for header in self.tags(node, "h1", "h2", "h3", "h4", "h5", "h6"):
@@ -942,6 +1107,10 @@ class Document:
                 content_score = 0
             tag = el.tag
 
+            image_content_block = self.is_image_content_block(el)
+            if self.handle_image_block(el, keep_all_images, MIN_LEN):
+                continue
+
             if weight + content_score < 0:
                 log.debug(
                     "Removed %s with score %6.3f and weight %-3s"
@@ -971,81 +1140,20 @@ class Document:
                 # pweight = 0
                 # pname = "no parent"
                 to_remove = False
-                reason = ""
+                reason = self._block_removal_reason(
+                    el,
+                    tag,
+                    weight,
+                    counts,
+                    content_length,
+                    link_density,
+                    image_content_block,
+                    MIN_LEN,
+                )
+                if reason is not None:
+                    to_remove = True
 
-                if keep_all_images and el.tag == 'div' and counts["img"] >= 1:
-                    continue
-                if counts["p"] and counts["img"] > 1 + counts["p"] * 1.3:
-                    reason = "too many images (%s)" % counts["img"]
-                    to_remove = True
-                elif counts["li"] > counts["p"] and tag not in ("ol", "ul"):
-                    reason = "more <li>s than <p>s"
-                    to_remove = True
-                elif counts["input"] > (counts["p"] / 3):
-                    reason = "less than 3x <p>s than <input>s"
-                    to_remove = True
-                elif content_length < MIN_LEN and counts["img"] == 0:
-                    reason = (
-                        "too short content length %s without a single image"
-                        % content_length
-                    )
-                    to_remove = True
-                elif content_length < MIN_LEN and counts["img"] > 2:
-                    reason = (
-                        "too short content length %s and too many images"
-                        % content_length
-                    )
-                    to_remove = True
-                elif (
-                    weight < 25
-                    and link_density
-                    > (
-                        0.25
-                        if tag in ("ul", "section")
-                        and el.xpath("ancestor::main | ancestor::article")
-                        else 0.2
-                    )
-                ):
-                    reason = "too many links {:.3f} for its weight {}".format(
-                        link_density,
-                        weight,
-                    )
-                    to_remove = True
-                elif weight >= 25 and link_density > 0.5:
-                    reason = "too many links {:.3f} for its weight {}".format(
-                        link_density,
-                        weight,
-                    )
-                    to_remove = True
-                elif (counts["embed"] == 1 and content_length < 75) or counts[
-                    "embed"
-                ] > 1:
-                    reason = (
-                        "<embed>s with too short content length, or too many <embed>s"
-                    )
-                    to_remove = True
-                elif not content_length:
-                    reason = "no content"
-                    to_remove = True
-                    #                if el.tag == 'div' and counts['img'] >= 1 and to_remove:
-                    #                    imgs = el.findall('.//img')
-                    #                    valid_img = False
-                    #                    log.debug(tounicode(el))
-                    #                    for img in imgs:
-                    #
-                    #                        height = img.get('height')
-                    #                        text_length = img.get('text_length')
-                    #                        log.debug ("height %s text_length %s" %(repr(height), repr(text_length)))
-                    #                        if to_int(height) >= 100 or to_int(text_length) >= 100:
-                    #                            valid_img = True
-                    #                            log.debug("valid image" + tounicode(img))
-                    #                            break
-                    #                    if valid_img:
-                    #                        to_remove = False
-                    #                        log.debug("Allowing %s" %el.text_content())
-                    #                        for desnode in self.tags(el, "table", "ul", "div"):
-                    #                            allowed[desnode] = True
-
+                if not content_length and reason is None:
                     # find x non empty preceding and succeeding siblings
                     i, j = 0, 0
                     x = 1

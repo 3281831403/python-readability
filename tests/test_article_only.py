@@ -754,6 +754,192 @@ class TestArticleOnly(unittest.TestCase):
 
         assert "<img" not in doc.summary()
 
+    GALLERY_HTML = """
+    <html><body>
+        <header><img src="/site/logo.png" alt="logo"/></header>
+        <main>
+            <article class="post">
+                <h1>Gallery story title</h1>
+                <p>Lead paragraph with a real sentence of article text.</p>
+                <section class="gallery-section">
+                    <img src="/content/section-1.jpg" alt="section one"/>
+                    <img src="/content/section-2.jpg" alt="section two"/>
+                </section>
+                <table class="image-table">
+                    <tr><td><img src="/content/table-1.jpg" alt="table one"/></td>
+                        <td><img src="/content/table-2.jpg" alt="table two"/></td></tr>
+                </table>
+                <ul class="image-list">
+                    <li><img src="/content/ul-1.jpg" alt="ul one"/></li>
+                    <li><img src="/content/ul-2.jpg" alt="ul two"/></li>
+                </ul>
+                <div class="gallery">
+                    <div class="gallery-item">
+                        <img src="/content/gallery-1.jpg" alt="gallery one"/>
+                    </div>
+                    <div class="gallery-item">
+                        <img src="/content/gallery-2.jpg" alt="gallery two"/>
+                    </div>
+                </div>
+            </article>
+            <aside class="sidebar">
+                <img src="/sidebar/ad.jpg" alt="ad"/>
+            </aside>
+            <section class="related-posts">
+                <h2>Related</h2>
+                <a href="/r1"><img src="/related/r1.jpg" alt="related one"/></a>
+                <a href="/r2"><img src="/related/r2.jpg" alt="related two"/></a>
+            </section>
+        </main>
+    </body></html>
+    """
+
+    GALLERY_IMAGE_SRCS = [
+        "/content/section-1.jpg",
+        "/content/section-2.jpg",
+        "/content/table-1.jpg",
+        "/content/table-2.jpg",
+        "/content/ul-1.jpg",
+        "/content/ul-2.jpg",
+        "/content/gallery-1.jpg",
+        "/content/gallery-2.jpg",
+    ]
+
+    def _image_srcs(self, summary):
+        from lxml.html import fragment_fromstring
+
+        root = fragment_fromstring(summary)
+        return [img.get("src") for img in root.findall(".//img")]
+
+    def test_gallery_default_summary_is_not_empty(self):
+        summary = Document(self.GALLERY_HTML).summary()
+
+        self.assertIn("Gallery story title", summary)
+        self.assertIn("real sentence of article text", summary)
+        self.assertEqual(self.GALLERY_IMAGE_SRCS, self._image_srcs(summary))
+
+    def test_gallery_partial_summary_matches_full_summary(self):
+        full = Document(self.GALLERY_HTML).summary(html_partial=False)
+        partial = Document(self.GALLERY_HTML).summary(html_partial=True)
+
+        self.assertTrue(partial.startswith("<div>"))
+        self.assertNotIn("<html", partial)
+        self.assertIn("<html><body><div>", full)
+        self.assertEqual(
+            self._image_srcs(full),
+            self._image_srcs(partial),
+        )
+        self.assertEqual(self.GALLERY_IMAGE_SRCS, self._image_srcs(partial))
+
+    def test_keep_all_images_preserves_every_content_image_in_order(self):
+        for html_partial in (False, True):
+            summary = Document(self.GALLERY_HTML).summary(
+                html_partial=html_partial, keep_all_images=True
+            )
+            self.assertEqual(
+                self.GALLERY_IMAGE_SRCS,
+                self._image_srcs(summary),
+                html_partial,
+            )
+
+    def test_keep_all_images_excludes_sidebar_and_related_images(self):
+        summary = Document(self.GALLERY_HTML).summary(keep_all_images=True)
+
+        self.assertNotIn("/sidebar/ad.jpg", summary)
+        self.assertNotIn("/related/r1.jpg", summary)
+        self.assertNotIn("/related/r2.jpg", summary)
+        self.assertNotIn("/site/logo.png", summary)
+
+    def test_keep_all_images_keeps_gallery_siblings_of_text_container(self):
+        html = """
+        <html><body><article class="post">
+            <div class="post-body">
+                <p>Lead paragraph with a real sentence of article text here.</p>
+                <p>Second paragraph with more article prose and punctuation.</p>
+            </div>
+            <section class="gallery-sibling">
+                <img src="/content/sib-section-1.jpg"/>
+                <img src="/content/sib-section-2.jpg"/>
+            </section>
+            <div class="gallery-sibling-div">
+                <img src="/content/sib-div-1.jpg"/>
+            </div>
+        </article></body></html>
+        """
+        summary = Document(html).summary(keep_all_images=True)
+
+        self.assertEqual(
+            [
+                "/content/sib-section-1.jpg",
+                "/content/sib-section-2.jpg",
+                "/content/sib-div-1.jpg",
+            ],
+            self._image_srcs(summary),
+        )
+
+    def test_image_only_article_never_becomes_empty_shell(self):
+        html = """
+        <html><body><article class="post">
+            <h1>Pure gallery</h1>
+            <section class="gallery-section">
+                <img src="/content/section-1.jpg"/>
+                <img src="/content/section-2.jpg"/>
+            </section>
+            <table><tr><td><img src="/content/table-1.jpg"/></td></tr></table>
+            <ul><li><img src="/content/ul-1.jpg"/></li></ul>
+            <div class="gallery"><img src="/content/gallery-1.jpg"/></div>
+        </article>
+        <aside class="sidebar"><img src="/sidebar/ad.jpg"/></aside>
+        </body></html>
+        """
+        expected = [
+            "/content/section-1.jpg",
+            "/content/section-2.jpg",
+            "/content/table-1.jpg",
+            "/content/ul-1.jpg",
+            "/content/gallery-1.jpg",
+        ]
+
+        for html_partial in (False, True):
+            for keep_all_images in (False, True):
+                summary = Document(html).summary(
+                    html_partial=html_partial,
+                    keep_all_images=keep_all_images,
+                )
+                self.assertEqual(
+                    expected,
+                    self._image_srcs(summary),
+                    (html_partial, keep_all_images),
+                )
+                self.assertNotIn("/sidebar/ad.jpg", summary)
+                if html_partial:
+                    self.assertTrue(
+                        summary.startswith("<div>"),
+                        (html_partial, keep_all_images),
+                    )
+
+    def test_short_related_image_block_is_never_kept(self):
+        html = """
+        <html><body><article class="post">
+            <h1>Story</h1>
+            <p>Lead paragraph with a real sentence of article text right now.</p>
+            <section>
+                <img src="/content/plain-1.jpg"/>
+                <img src="/content/plain-2.jpg"/>
+            </section>
+            <div class="related-posts">
+                <a href="/r1"><img src="/related/r1.jpg"/></a>
+                <a href="/r2"><img src="/related/r2.jpg"/></a>
+            </div>
+        </article></body></html>
+        """
+        for keep_all_images in (False, True):
+            summary = Document(html).summary(keep_all_images=keep_all_images)
+            srcs = self._image_srcs(summary)
+            self.assertEqual(
+                ["/content/plain-1.jpg", "/content/plain-2.jpg"], srcs
+            )
+
     def test_cjk_summary(self):
         """Check we can extract CJK text correctly."""
         html = """
